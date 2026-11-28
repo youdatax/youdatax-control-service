@@ -1,0 +1,363 @@
+/*
+ *  Copyright (c) 2022 Microsoft Corporation
+ *
+ *  This program and the accompanying materials are made available under the
+ *  terms of the Apache License, Version 2.0 which is available at
+ *  https://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  SPDX-License-Identifier: Apache-2.0
+ *
+ *  Contributors:
+ *       Microsoft Corporation - initial API and implementation
+ *       Fraunhofer-Gesellschaft zur Förderung der angewandten Forschung e.V. - initiate provider process
+ *       Cofinity-X - make participant id extraction dependent on dataspace profile context
+ *       Schaeffler AG - GetDspRequest refactor
+ *
+ */
+
+package org.eclipse.edc.connector.controlplane.services.transferprocess;
+
+import io.opentelemetry.instrumentation.annotations.WithSpan;
+import org.eclipse.edc.connector.controlplane.contract.spi.negotiation.store.ContractNegotiationStore;
+import org.eclipse.edc.connector.controlplane.contract.spi.types.agreement.ContractAgreement;
+import org.eclipse.edc.connector.controlplane.contract.spi.validation.ContractValidationService;
+import org.eclipse.edc.connector.controlplane.services.spi.protocol.ProtocolTokenValidator;
+import org.eclipse.edc.connector.controlplane.services.spi.transferprocess.TransferProcessProtocolService;
+import org.eclipse.edc.connector.controlplane.transfer.spi.flow.DataFlowController;
+import org.eclipse.edc.connector.controlplane.transfer.spi.observe.TransferProcessObservable;
+import org.eclipse.edc.connector.controlplane.transfer.spi.store.TransferProcessStore;
+import org.eclipse.edc.connector.controlplane.transfer.spi.types.DataAddressStore;
+import org.eclipse.edc.connector.controlplane.transfer.spi.types.TransferProcess;
+import org.eclipse.edc.connector.controlplane.transfer.spi.types.TransferProcessStates;
+import org.eclipse.edc.connector.controlplane.transfer.spi.types.protocol.TransferCompletionMessage;
+import org.eclipse.edc.connector.controlplane.transfer.spi.types.protocol.TransferProcessRequestMessage;
+import org.eclipse.edc.connector.controlplane.transfer.spi.types.protocol.TransferRemoteMessage;
+import org.eclipse.edc.connector.controlplane.transfer.spi.types.protocol.TransferRequestMessage;
+import org.eclipse.edc.connector.controlplane.transfer.spi.types.protocol.TransferStartMessage;
+import org.eclipse.edc.connector.controlplane.transfer.spi.types.protocol.TransferSuspensionMessage;
+import org.eclipse.edc.connector.controlplane.transfer.spi.types.protocol.TransferTerminationMessage;
+import org.eclipse.edc.participant.spi.ParticipantAgent;
+import org.eclipse.edc.participantcontext.spi.types.ParticipantContext;
+import org.eclipse.edc.policy.context.request.spi.RequestTransferProcessPolicyContext;
+import org.eclipse.edc.spi.iam.TokenRepresentation;
+import org.eclipse.edc.spi.monitor.Monitor;
+import org.eclipse.edc.spi.query.Criterion;
+import org.eclipse.edc.spi.result.ServiceResult;
+import org.eclipse.edc.spi.result.StoreResult;
+import org.eclipse.edc.spi.types.domain.message.RemoteMessage;
+import org.eclipse.edc.transaction.spi.TransactionContext;
+import org.jetbrains.annotations.NotNull;
+
+import java.util.Optional;
+import java.util.function.Function;
+
+import static java.lang.String.format;
+import static java.util.stream.Collectors.joining;
+import static org.eclipse.edc.connector.controlplane.transfer.spi.types.TransferProcess.Type.CONSUMER;
+import static org.eclipse.edc.connector.controlplane.transfer.spi.types.TransferProcessStates.RESUMED;
+import static org.eclipse.edc.connector.controlplane.transfer.spi.types.TransferProcessStates.SUSPENDED;
+import static org.eclipse.edc.participantcontext.spi.types.ParticipantResource.queryByParticipantContextId;
+
+public class TransferProcessProtocolServiceImpl implements TransferProcessProtocolService {
+
+    private final TransferProcessStore transferProcessStore;
+    private final TransactionContext transactionContext;
+    private final ContractNegotiationStore negotiationStore;
+    private final ContractValidationService contractValidationService;
+    private final TransferProcessObservable observable;
+    private final ProtocolTokenValidator protocolTokenValidator;
+    private final Monitor monitor;
+    private final DataFlowController dataFlowController;
+    private final DataAddressStore dataAddressStore;
+    private final TransferProcessProviderFactory transferProcessProviderFactory;
+
+    public TransferProcessProtocolServiceImpl(TransferProcessStore transferProcessStore,
+                                              TransactionContext transactionContext,
+                                              ContractNegotiationStore negotiationStore,
+                                              ContractValidationService contractValidationService,
+                                              ProtocolTokenValidator protocolTokenValidator,
+                                              TransferProcessObservable observable,
+                                              Monitor monitor,
+                                              DataFlowController dataFlowController, DataAddressStore dataAddressStore,
+                                              TransferProcessProviderFactory transferProcessProviderFactory) {
+        this.transferProcessStore = transferProcessStore;
+        this.transactionContext = transactionContext;
+        this.negotiationStore = negotiationStore;
+        this.contractValidationService = contractValidationService;
+        this.protocolTokenValidator = protocolTokenValidator;
+        this.observable = observable;
+        this.monitor = monitor;
+        this.dataFlowController = dataFlowController;
+        this.dataAddressStore = dataAddressStore;
+        this.transferProcessProviderFactory = transferProcessProviderFactory;
+    }
+
+    @Override
+    @WithSpan
+    @NotNull
+    public ServiceResult<TransferProcess> notifyRequested(ParticipantContext participantContext, TransferRequestMessage message, TokenRepresentation tokenRepresentation) {
+        return transactionContext.execute(() -> fetchContractAgreement(participantContext, message)
+                .compose(contractAgreement -> verifyRequest(participantContext, tokenRepresentation, message, contractAgreement))
+                .compose(context -> requestedAction(participantContext, message, context)));
+    }
+
+    @Override
+    @WithSpan
+    @NotNull
+    public ServiceResult<TransferProcess> notifyStarted(ParticipantContext participantContext, TransferStartMessage message, TokenRepresentation tokenRepresentation) {
+        return transactionContext.execute(() -> fetchRequestContext(participantContext, message.getProcessId())
+                .compose(context -> verifyRequest(participantContext, tokenRepresentation, message, context.agreement()))
+                .compose(context -> onMessageDo(message, transferProcess -> startedAction(message, transferProcess)))
+        );
+    }
+
+    @Override
+    @WithSpan
+    @NotNull
+    public ServiceResult<TransferProcess> notifyCompleted(ParticipantContext participantContext, TransferCompletionMessage message, TokenRepresentation tokenRepresentation) {
+        return transactionContext.execute(() -> fetchRequestContext(participantContext, message.getProcessId())
+                .compose(context -> verifyRequest(participantContext, tokenRepresentation, message, context.agreement()))
+                .compose(i -> onMessageDo(message, transferProcess -> completedAction(message, transferProcess)))
+        );
+    }
+
+    @Override
+    @WithSpan
+    @NotNull
+    public ServiceResult<TransferProcess> notifySuspended(ParticipantContext participantContext, TransferSuspensionMessage message, TokenRepresentation tokenRepresentation) {
+        return transactionContext.execute(() -> fetchRequestContext(participantContext, message.getProcessId())
+                .compose(context -> verifyRequest(participantContext, tokenRepresentation, message, context.agreement()))
+                .compose(i -> onMessageDo(message, transferProcess -> suspendedAction(message, transferProcess)))
+        );
+    }
+
+    @Override
+    @WithSpan
+    @NotNull
+    public ServiceResult<TransferProcess> notifyTerminated(ParticipantContext participantContext, TransferTerminationMessage message, TokenRepresentation tokenRepresentation) {
+        return transactionContext.execute(() -> fetchRequestContext(participantContext, message.getProcessId())
+                .compose(context -> verifyRequest(participantContext, tokenRepresentation, message, context.agreement()))
+                .compose(i -> onMessageDo(message, transferProcess -> terminatedAction(message, transferProcess)))
+        );
+    }
+
+    @Override
+    @WithSpan
+    @NotNull
+    public ServiceResult<TransferProcess> findById(ParticipantContext participantContext, TransferProcessRequestMessage message, TokenRepresentation tokenRepresentation) {
+
+        return transactionContext.execute(() -> fetchRequestContext(participantContext, message.getTransferProcessId())
+                .compose(context -> verifyRequest(participantContext, tokenRepresentation, message, context.agreement())
+                        .map(it -> context.transferProcess()))
+        );
+    }
+
+    @NotNull
+    private ServiceResult<TransferProcess> requestedAction(ParticipantContext participantContext, TransferRequestMessage message, ClaimTokenContext context) {
+        var transferType = message.getTransferType();
+        var supportedTransferTypes = dataFlowController.transferTypesFor(context.agreement().getAssetId());
+        if (!supportedTransferTypes.contains(transferType)) {
+            return ServiceResult.badRequest("TransferType %s is not supported".formatted(transferType));
+        }
+
+        var validationResult = contractValidationService.validateAgreement(context.participantAgent(), context.agreement());
+        if (validationResult.failed()) {
+            return ServiceResult.conflict(format("Cannot process %s because %s", message.getClass().getSimpleName(), "agreement not found or not valid"));
+        }
+
+        var existingTransferProcess = transferProcessStore.findForCorrelationId(message.getConsumerPid());
+        if (existingTransferProcess != null) {
+            return ServiceResult.success(existingTransferProcess);
+        }
+
+        return transferProcessProviderFactory.create(participantContext, message, context.agreement(), context.participantAgent())
+                .compose(process -> {
+                    var dataAddressStorage = message.getDataAddress() == null
+                            ? StoreResult.success()
+                            : dataAddressStore.store(message.getDataAddress(), process);
+
+                    return dataAddressStorage
+                            .compose(i -> {
+                                process.protocolMessageReceived(message.getId());
+                                return update(process);
+                            })
+                            .onSuccess(i -> observable.invokeForEach(l -> l.initiated(process)))
+                            .flatMap(ServiceResult::from)
+                            .map(ignored -> process);
+                });
+    }
+
+    @NotNull
+    private ServiceResult<TransferProcess> startedAction(TransferStartMessage message, TransferProcess transferProcess) {
+        if (transferProcess.currentStateIsOneOf(SUSPENDED)) {
+            transferProcess.protocolMessageReceived(message.getId());
+            transferProcess.transitionResuming();
+
+            StoreResult<Void> eventualDataAddressStorage = transferProcess.isDataAddressOwner()
+                    ? StoreResult.success() : dataAddressStore.store(message.getDataAddress(), transferProcess);
+
+            return eventualDataAddressStorage
+                    .compose(i -> update(transferProcess))
+                    .onSuccess(i -> observable.invokeForEach(l -> l.resuming(transferProcess)))
+                    .flatMap(ServiceResult::from)
+                    .map(it -> transferProcess);
+        }
+
+        if (transferProcess.currentStateIsOneOf(RESUMED)) {
+            if (message.getDataAddress() == null) {
+                return ServiceResult.badRequest("Cannot resume transfer without a DataAddress");
+            }
+
+            transferProcess.protocolMessageReceived(message.getId());
+            transferProcess.transitionResuming();
+            return dataAddressStore.store(message.getDataAddress(), transferProcess)
+                    .compose(i -> update(transferProcess))
+                    .onSuccess(i -> observable.invokeForEach(l -> l.resuming(transferProcess)))
+                    .flatMap(ServiceResult::from)
+                    .map(i -> transferProcess);
+
+        }
+
+        if (transferProcess.getType() == CONSUMER && transferProcess.canBeStartedConsumer()) {
+            StoreResult<Void> dataAddressStorage = message.getDataAddress() != null
+                    ? dataAddressStore.store(message.getDataAddress(), transferProcess)
+                    : StoreResult.success();
+
+            transferProcess.protocolMessageReceived(message.getId());
+            transferProcess.setContentDataAddress(message.getDataAddress());
+            transferProcess.transitionStartupRequested();
+            return dataAddressStorage
+                    .compose(i -> update(transferProcess))
+                    .onSuccess(ignored -> observable.invokeForEach(l -> l.startupRequested(transferProcess)))
+                    .flatMap(ServiceResult::from)
+                    .map(i -> transferProcess);
+        }
+
+        return ServiceResult.conflict(format("Cannot process %s because %s", message.getClass().getSimpleName(), "transfer cannot be started"));
+    }
+
+    @NotNull
+    private ServiceResult<TransferProcess> completedAction(TransferCompletionMessage message, TransferProcess transferProcess) {
+        if (transferProcess.canBeCompleted()) {
+            transferProcess.protocolMessageReceived(message.getId());
+            transferProcess.transitionCompletingRequested();
+            update(transferProcess);
+            // this is not completed yet, just requested - the actual completion will happen later
+            observable.invokeForEach(l -> l.completingRequested(transferProcess));
+            return ServiceResult.success(transferProcess);
+        } else {
+            return ServiceResult.conflict(format("Cannot process %s because %s", message.getClass().getSimpleName(), "transfer cannot be completed"));
+        }
+    }
+
+    @NotNull
+    private ServiceResult<TransferProcess> suspendedAction(TransferSuspensionMessage message, TransferProcess transferProcess) {
+        if (transferProcess.canBeSuspended()) {
+            var reason = message.getReason().stream().map(Object::toString).collect(joining(", "));
+            transferProcess.transitionSuspendingRequested(reason);
+            transferProcess.protocolMessageReceived(message.getId());
+            update(transferProcess);
+            observable.invokeForEach(l -> l.suspendingRequested(transferProcess));
+
+            return ServiceResult.success(transferProcess);
+        } else {
+            return ServiceResult.conflict(format("Cannot process %s because %s", message.getClass().getSimpleName(), "transfer cannot be suspended"));
+        }
+    }
+
+    @NotNull
+    private ServiceResult<TransferProcess> terminatedAction(TransferTerminationMessage message, TransferProcess transferProcess) {
+        if (transferProcess.canBeTerminated()) {
+            transferProcess.transitionTerminatingRequested(message.getReason());
+            transferProcess.protocolMessageReceived(message.getId());
+            update(transferProcess);
+            observable.invokeForEach(l -> l.terminatingRequested(transferProcess));
+            return ServiceResult.success(transferProcess);
+        } else {
+            return ServiceResult.conflict(format("Cannot process %s because %s", message.getClass().getSimpleName(), "transfer cannot be terminated"));
+        }
+    }
+
+    private ServiceResult<ContractAgreement> fetchContractAgreement(ParticipantContext participantContext, TransferRequestMessage message) {
+        return Optional.ofNullable(findAgreement(participantContext, message.getContractId()))
+                .filter(agreement -> participantContext.getParticipantContextId().equals(agreement.getParticipantContextId()))
+                .map(ServiceResult::success)
+                .orElseGet(() -> ServiceResult.notFound(format("Cannot process %s because %s", message.getClass().getSimpleName(), "agreement not found or not valid")));
+    }
+
+    private ServiceResult<TransferMessageContext> fetchRequestContext(ParticipantContext participantContext, String transferProcessId) {
+        var transferProcess = transferProcessStore.findById(transferProcessId);
+        if (transferProcess == null) {
+            return notFound(transferProcessId);
+        }
+
+        if (!participantContext.getParticipantContextId().equals(transferProcess.getParticipantContextId())) {
+            return notFound(transferProcess.getId());
+        }
+
+        var agreement = negotiationStore.findContractAgreement(transferProcess.getContractId());
+        if (agreement == null) {
+            return ServiceResult.notFound(format("No transfer process with id %s found", transferProcess.getId()));
+        }
+        return ServiceResult.success(new TransferMessageContext(agreement, transferProcess));
+    }
+
+    private ServiceResult<ClaimTokenContext> verifyRequest(ParticipantContext participantContext, TokenRepresentation tokenRepresentation, RemoteMessage message, ContractAgreement contractAgreement) {
+        var result = protocolTokenValidator.verify(participantContext, tokenRepresentation, RequestTransferProcessPolicyContext::new, contractAgreement.getPolicy(), message);
+        if (result.failed()) {
+            monitor.debug(() -> "Verification Failed: %s".formatted(result.getFailureDetail()));
+            return ServiceResult.notFound("Not found");
+        }
+
+        var participantAgent = result.getContent();
+        var validation = contractValidationService.validateRequest(participantAgent, contractAgreement);
+        if (validation.failed()) {
+            return ServiceResult.badRequest(validation.getFailureMessages());
+        }
+
+        return ServiceResult.success(new ClaimTokenContext(participantAgent, contractAgreement));
+    }
+
+    private ServiceResult<TransferProcess> onMessageDo(TransferRemoteMessage message,
+                                                       Function<TransferProcess, ServiceResult<TransferProcess>> action) {
+
+        return transferProcessStore
+                .findByIdAndLease(message.getProcessId())
+                .flatMap(ServiceResult::from)
+                .compose(transferProcess -> {
+                    if (transferProcess.shouldIgnoreIncomingMessage(message.getId())) {
+                        transferProcessStore.breakLease(transferProcess);
+                        return ServiceResult.success(transferProcess);
+                    }
+
+                    return action.apply(transferProcess)
+                            .onFailure(f -> transferProcessStore.breakLease(transferProcess));
+                });
+    }
+
+    private ContractAgreement findAgreement(ParticipantContext participantContext, String contractId) {
+        var query = queryByParticipantContextId(participantContext.getParticipantContextId())
+                .filter(Criterion.criterion("agreementId", "=", contractId))
+                .build();
+        try (var stream = negotiationStore.queryAgreements(query)) {
+            return stream.findFirst().orElse(null);
+        }
+    }
+
+    private <T> ServiceResult<T> notFound(String transferProcessId) {
+        return ServiceResult.notFound(format("No transfer process with id %s found", transferProcessId));
+    }
+
+    private StoreResult<Void> update(TransferProcess transferProcess) {
+        return transferProcessStore.save(transferProcess)
+                .onSuccess(ignored -> {
+                    monitor.debug(format("[%s] TransferProcess %s is now in state %s", transferProcess.getType(), transferProcess.getId(), TransferProcessStates.from(transferProcess.getState())));
+                });
+    }
+
+    private record TransferMessageContext(ContractAgreement agreement, TransferProcess transferProcess) {
+    }
+
+    private record ClaimTokenContext(ParticipantAgent participantAgent, ContractAgreement agreement) {
+    }
+}
